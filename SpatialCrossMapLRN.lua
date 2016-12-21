@@ -36,15 +36,11 @@ function LRN:createIODescriptors(input)
       input:size(1) ~= self.iSize[1] or input:size(2) ~= self.iSize[2]
    or input:size(3) ~= self.iSize[3] or input:size(4) ~= self.iSize[4] then
       self.iSize = input:size()
-      self.gradInput:resizeAs(input)
       self.output:resizeAs(input)
 
       -- create input/output descriptor
       self.iDesc = cudnn.toDescriptor(input)
       if not batch then
-         self.gradInput = self.gradInput:view(self.gradInput:size(2),
-                                              self.gradInput:size(3),
-                                              self.gradInput:size(4))
          self.output = self.output:view(self.output:size(2),
                                         self.output:size(3),
                                         self.output:size(4))
@@ -52,8 +48,8 @@ function LRN:createIODescriptors(input)
    end
 end
 
-local one = torch.FloatTensor({1});
-local zero = torch.FloatTensor({0});
+
+
 
 function LRN:updateOutput(input)
    if self.K then self.k, self.K = self.K, nil end
@@ -62,14 +58,17 @@ function LRN:updateOutput(input)
    errcheck('cudnnLRNCrossChannelForward', cudnn.getHandle(),
             self.LRNDesc[0],
             'CUDNN_LRN_CROSS_CHANNEL_DIM1',
-            one:data(),
+            cudnn.scalar(input, 1),
             self.iDesc[0], input:data(),
-            zero:data(),
+            cudnn.scalar(input, 0),
             self.iDesc[0], self.output:data());
    return self.output
 end
 
 function LRN:updateGradInput(input, gradOutput)
+   if not self.gradInput then return end
+   self.gradInput:resizeAs(input)
+
    assert(gradOutput:dim() == 3 or gradOutput:dim() == 4);
    if not gradOutput:isContiguous() then
       self._gradOutput = self._gradOutput or gradOutput.new()
@@ -81,11 +80,11 @@ function LRN:updateGradInput(input, gradOutput)
    errcheck('cudnnLRNCrossChannelBackward',
             cudnn.getHandle(), self.LRNDesc[0],
             'CUDNN_LRN_CROSS_CHANNEL_DIM1',
-            one:data(),
+            cudnn.scalar(input, 1),
             self.iDesc[0], self.output:data(),
             self.iDesc[0], gradOutput:data(),
             self.iDesc[0], input:data(),
-            zero:data(),
+            cudnn.scalar(input, 0),
             self.iDesc[0], self.gradInput:data());
    return self.gradInput
 end

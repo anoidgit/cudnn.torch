@@ -4,6 +4,7 @@ local errcheck = cudnn.errcheck
 
 BatchNormalization.mode = 'CUDNN_BATCHNORM_PER_ACTIVATION'
 BatchNormalization.nDim = 2
+BatchNormalization.__version = 2
 
 function BatchNormalization:__init(nFeature, eps, momentum, affine)
    parent.__init(self)
@@ -18,7 +19,7 @@ function BatchNormalization:__init(nFeature, eps, momentum, affine)
    self.momentum = momentum or 0.1
 
    self.running_mean = torch.zeros(nFeature)
-   self.running_std = torch.ones(nFeature)
+   self.running_var = torch.ones(nFeature)
    if self.affine then
       self.weight = torch.Tensor(nFeature)
       self.bias = torch.Tensor(nFeature)
@@ -36,18 +37,17 @@ function BatchNormalization:reset()
       self.bias:zero()
    end
    self.running_mean:zero()
-   self.running_std:fill(1)
+   self.running_var:fill(1)
 end
 
 function BatchNormalization:createIODescriptors(input)
    assert(input:dim() == self.nDim)
-   assert(torch.typename(self.weight) == 'torch.CudaTensor' and torch.typename(self.bias) == 'torch.CudaTensor',
-          'Only CUDA tensors are supported for cudnn.BatchNormalization!')
+   assert(cudnn.typemap[torch.typename(self.weight)], 'Only Cuda supported duh!')
+   assert(cudnn.typemap[torch.typename(self.bias)] or not self.bias, 'Only Cuda supported duh!')
    if not self.iDesc or not self.oDesc or not input:isSize(self.iSize) then
       local nFeature = self.running_mean:numel()
       self.iSize = input:size()
       self.output:resizeAs(input)
-      self.gradInput:resizeAs(input)
       self.iDesc = cudnn.toDescriptor(input)
       self.oDesc = cudnn.toDescriptor(self.output)
       local biasSize = torch.ones(self.nDim):totable()
@@ -56,45 +56,52 @@ function BatchNormalization:createIODescriptors(input)
    end
 end
 
-local one = torch.FloatTensor({1});
-local zero = torch.FloatTensor({0});
-local scaleTens = torch.FloatTensor(1);
-
 function BatchNormalization:updateOutput(input)
    self:createIODescriptors(input)
 
-   self.save_mean = self.save_mean or input.new()
+   self.save_mean = self.save_mean or self.running_mean.new()
    self.save_mean:resizeAs(self.running_mean)
-   self.save_std = self.save_std or input.new()
-   self.save_std:resizeAs(self.running_std)
+   self.save_std = self.save_std or self.running_mean.new()
+   self.save_std:resizeAs(self.running_var)
 
    if self.train then
       errcheck('cudnnBatchNormalizationForwardTraining',
-            cudnn.getHandle(), self.mode, one:data(), zero:data(),
+            cudnn.getHandle(), self.mode, cudnn.scalar(input, 1), cudnn.scalar(input, 0),
             self.iDesc[0], input:data(), self.oDesc[0], self.output:data(),
             self.sDesc[0], self.weight:data(), self.bias:data(),
-            self.momentum, self.running_mean:data(), self.running_std:data(), self.eps, self.save_mean:data(), self.save_std:data());
+            self.momentum, self.running_mean:data(), self.running_var:data(), self.eps, self.save_mean:data(), self.save_std:data());
    else
       errcheck('cudnnBatchNormalizationForwardInference',
-            cudnn.getHandle(), self.mode, one:data(), zero:data(),
+            cudnn.getHandle(), self.mode, cudnn.scalar(input, 1), cudnn.scalar(input, 0),
             self.iDesc[0], input:data(), self.oDesc[0], self.output:data(),
             self.sDesc[0], self.weight:data(), self.bias:data(),
-            self.running_mean:data(), self.running_std:data(), self.eps);
+            self.running_mean:data(), self.running_var:data(), self.eps);
    end
    return self.output
 end
 
 local function backward(self,input,gradOutput, scale)
+    assert(self.train, 'cudnn.BatchNormalization doesnt support backward in evaluate, use nn')
+    self.scaleT = self.scaleT or self.weight.new(1)
+    -- this line forces this member to always be on CPU (needed for cudnn)
+    self.scaleT = torch.type(self.weight) == 'torch.CudaDoubleTensor'
+       and self.scaleT:double() or self.scaleT:float()
+    scale = scale or 1.0
+    self.scaleT[1] = scale
+
    assert(gradOutput:isContiguous())
    self:createIODescriptors(input)
-   scale = scale or 1
-   scaleTens:fill(scale)
+   self.gradInput:resizeAs(input)
    errcheck('cudnnBatchNormalizationBackward',
-      cudnn.getHandle(), self.mode, one:data(), zero:data(), scaleTens:data(), one:data(),
-      self.iDesc[0], input:data(), self.iDesc[0], gradOutput:data(), self.iDesc[0], self.gradInput:data(),
-                     -- input is bottom, gradOutput is topDiff, self.gradInput is resultBottomDiff
-      self.sDesc[0], self.weight:data(), self.gradWeight:data(), self.gradBias:data(),
-      self.eps, self.save_mean:data(), self.save_std:data());
+            cudnn.getHandle(), self.mode, cudnn.scalar(input, 1),
+            cudnn.scalar(input, 0), self.scaleT:data(), cudnn.scalar(input, 1),
+            self.iDesc[0], input:data(), self.iDesc[0],
+            gradOutput:data(), self.iDesc[0], self.gradInput:data(),
+            -- input is bottom, gradOutput is topDiff,
+            -- self.gradInput is resultBottomDiff
+            self.sDesc[0], self.weight:data(), self.gradWeight:data(),
+            self.gradBias:data(), self.eps, self.save_mean:data(),
+            self.save_std:data());
    return self.gradInput
 end
 
@@ -117,6 +124,16 @@ function BatchNormalization:clearDesc()
    self.sDesc = nil
 end
 
+function BatchNormalization:read(file, version)
+   parent.read(self, file)
+   if version < 2 then
+      if self.running_std then
+         self.running_var = self.running_std:pow(-2):add(-self.eps)
+         self.running_std = nil
+      end
+   end
+end
+
 function BatchNormalization:write(f)
    self:clearDesc()
    local var = {}
@@ -124,6 +141,14 @@ function BatchNormalization:write(f)
       var[k] = v
    end
    f:writeObject(var)
+end
+
+function BatchNormalization:type(type, tensorCache)
+   local _type = type == 'torch.CudaHalfTensor' and 'torch.CudaTensor' or type
+   parent.type(self, _type, tensorCache)
+   self.output = self.output:type(type)
+   self.gradInput = self.gradInput:type(type)
+   return self
 end
 
 function BatchNormalization:clearState()

@@ -33,7 +33,7 @@ function Pooling:resetPoolDescriptors()
    local ker = torch.IntTensor({self.kH, self.kW})
    local str = torch.IntTensor({self.dH, self.dW})
    local pad = torch.IntTensor({self.padH, self.padW})
-   errcheck('cudnnSetPoolingNdDescriptor', self.poolDesc[0], self.mode, 2,
+   errcheck('cudnnSetPoolingNdDescriptor', self.poolDesc[0], self.mode, 'CUDNN_PROPAGATE_NAN', 2,
             ker:data(), pad:data(), str:data());
    local function destroyPoolDesc(d)
       errcheck('cudnnDestroyPoolingDescriptor', d[0]);
@@ -53,9 +53,6 @@ function Pooling:createIODescriptors(input)
       input:size(1) ~= self.iSize[1] or input:size(2) ~= self.iSize[2]
    or input:size(3) ~= self.iSize[3] or input:size(4) ~= self.iSize[4] then
       self.iSize = input:size()
-      -- resize gradInput
-      self.gradInput:resizeAs(input)
-      -- resize output
       local oW, oH
       if self.ceil_mode then
          oW = math.ceil((input:size(4)+self.padW*2 - self.kW)/self.dW + 1)
@@ -64,15 +61,13 @@ function Pooling:createIODescriptors(input)
          oW = math.floor((input:size(4)+self.padW*2 - self.kW)/self.dW + 1)
          oH = math.floor((input:size(3)+self.padH*2 - self.kH)/self.dH + 1)
       end
+      assert(oW > 0 and oH > 0, 'input image smaller than kernel')
       self.output:resize(input:size(1), input:size(2), oH, oW)
 
       -- create input/output descriptor
       self.iDesc = cudnn.toDescriptor(input)
       self.oDesc = cudnn.toDescriptor(self.output)
       if not batch then
-         self.gradInput = self.gradInput:view(self.gradInput:size(2),
-                                              self.gradInput:size(3),
-                                              self.gradInput:size(4))
          self.output = self.output:view(self.output:size(2),
                                         self.output:size(3),
                                         self.output:size(4))
@@ -80,17 +75,14 @@ function Pooling:createIODescriptors(input)
    end
 end
 
-local one = torch.FloatTensor({1});
-local zero = torch.FloatTensor({0});
-
 function Pooling:updateOutput(input)
    if not self.poolDesc then self:resetPoolDescriptors() end
    self:createIODescriptors(input)
    errcheck('cudnnPoolingForward', cudnn.getHandle(),
             self.poolDesc[0],
-            one:data(),
+            cudnn.scalar(input, 1),
             self.iDesc[0], input:data(),
-            zero:data(),
+            cudnn.scalar(input, 0),
             self.oDesc[0], self.output:data());
    return self.output
 end
@@ -102,15 +94,16 @@ function Pooling:updateGradInput(input, gradOutput)
       self._gradOutput:resizeAs(gradOutput):copy(gradOutput)
       gradOutput = self._gradOutput
    end
+   self.gradInput:resizeAs(input)
    if not self.poolDesc then self:resetPoolDescriptors() end
    self:createIODescriptors(input)
    errcheck('cudnnPoolingBackward',
             cudnn.getHandle(), self.poolDesc[0],
-            one:data(),
+            cudnn.scalar(input, 1),
             self.oDesc[0], self.output:data(),
             self.oDesc[0], gradOutput:data(),
             self.iDesc[0], input:data(),
-            zero:data(),
+            cudnn.scalar(input, 0),
             self.iDesc[0], self.gradInput:data());
    return self.gradInput
 end

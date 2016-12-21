@@ -35,43 +35,38 @@ function SpatialSoftMax:createIODescriptors(input)
       input:size(1) ~= self.iSize[1] or input:size(2) ~= self.iSize[2]
    or input:size(3) ~= self.iSize[3] or input:size(4) ~= self.iSize[4] then
       self.iSize = input:size()
-      self.gradInput:resizeAs(input)
       self.output:resizeAs(input)
       self.iDesc = cudnn.toDescriptor(input)
       self.oDesc = cudnn.toDescriptor(self.output)
       if not singleDim and not batch then
-         self.gradInput = self.gradInput:view(self.gradInput:size(2),
-                                              self.gradInput:size(3),
-                                              self.gradInput:size(4))
          self.output = self.output:view(self.output:size(2),
                                         self.output:size(3),
                                         self.output:size(4))
       elseif singleDim and not batch then
-         self.gradInput = self.gradInput:view(self.gradInput:size(2))
          self.output = self.output:view(self.output:size(2))
       elseif singleDim and batch then
-         self.gradInput = self.gradInput:view(self.gradInput:size(1), self.gradInput:size(2))
          self.output = self.output:view(self.output:size(1), self.output:size(2))
       end
    end
 end
 
-local one = torch.FloatTensor({1});
-local zero = torch.FloatTensor({0});
+
+
 
 function SpatialSoftMax:updateOutput(input)
    self:createIODescriptors(input)
    errcheck('cudnnSoftmaxForward',
             cudnn.getHandle(),
             self.algorithm, self.mode,
-            one:data(),
+            cudnn.scalar(input, 1),
             self.iDesc[0], input:data(),
-            zero:data(),
+            cudnn.scalar(input, 0),
             self.oDesc[0], self.output:data());
    return self.output
 end
 
 function SpatialSoftMax:updateGradInput(input, gradOutput)
+   self.gradInput:resizeAs(input)
    if not gradOutput:isContiguous() then
       self._gradOutput = self._gradOutput or gradOutput.new()
       self._gradOutput:resizeAs(gradOutput):copy(gradOutput)
@@ -82,10 +77,10 @@ function SpatialSoftMax:updateGradInput(input, gradOutput)
    errcheck('cudnnSoftmaxBackward',
             cudnn.getHandle(),
             self.algorithm, self.mode,
-            one:data(),
+            cudnn.scalar(input, 1),
             self.oDesc[0], self.output:data(),
             self.oDesc[0], gradOutput:data(),
-            zero:data(),
+            cudnn.scalar(input, 0),
             self.iDesc[0], self.gradInput:data());
    return self.gradInput
 end

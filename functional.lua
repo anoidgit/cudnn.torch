@@ -5,19 +5,31 @@
 local cudnn = require 'cudnn.env'
 local ffi = require 'ffi'
 local errcheck = cudnn.errcheck
-
-local NULL
-if not jit then
-    NULL = ffi.C.NULL
-end
-
+local find = require 'cudnn.find'
 cudnn.functional = {}
 
-local one = torch.FloatTensor({1});
-local zero = torch.FloatTensor({0});
+local function getMathType(weight)
+   local mathType = cudnn.configmap(torch.type(weight))
+   if mathType == 'CUDNN_DATA_HALF' then
+      -- explicitly set math type to fp32 to avoid possible failures with fp16 and exotic sizes
+      -- this can be changed back when ported to find() as it has built-in fallback mechanism
+      mathType = 'CUDNN_DATA_FLOAT'
+   end
+   return mathType
+end
 
 local function Batch2D(t)
     return t:view(1, t:size(1), t:size(2), t:size(3))
+end
+
+local function scalar(tensor, v)
+   if v ~= 1 and v ~= 0 then
+      local a = torch.type(tensor) == 'torch.CudaDoubleTensor'
+            and torch.DoubleTensor({v}) or torch.FloatTensor({v})
+      return a:data()
+   else
+      return cudnn.scalar(tensor, v)
+   end
 end
 
 -- accumulates the bias into output.
@@ -28,24 +40,23 @@ cudnn.functional.bias2D_updateOutput = function(handle, bias, output)
     local biasDesc = cudnn.toDescriptor(bias:view(1, bias:nElement(),1,1))
     local oDesc = cudnn.toDescriptor(output)
     errcheck('cudnnAddTensor', handle,
-             one:data(), biasDesc[0], bias:data(),
-             one:data(), oDesc[0], output:data())
+             cudnn.scalar(output, 1), biasDesc[0], bias:data(),
+             cudnn.scalar(output, 1), oDesc[0], output:data())
 end
 
 -- accumulates the gradients into gradBias.
 -- gradBias is assumed to be allocated and given.
-cudnn.functional.bias2D_accGradParameters = function(handle, gradOutput, gradBias, scale)
+cudnn.functional.bias2D_accGradParameters = function(handle, gradOutput, gradBias, scale, alpha)
     gradOutput = gradOutput:dim() == 3 and Batch2D(gradOutput) or gradOutput
-    scale = scale or 1.0
-    local scaleT = torch.FloatTensor({scale})
     local oDesc = cudnn.toDescriptor(gradOutput)
     local biasDesc = cudnn.toDescriptor(gradBias:view(1, gradBias:nElement(),1,1))
     errcheck('cudnnConvolutionBackwardBias', handle,
-             scaleT:data(),
+             scalar(gradBias, scale or 1),
              oDesc[0], gradOutput:data(),
-             one:data(),
+             scalar(gradBias, alpha or 1),
              biasDesc[0], gradBias:data())
 end
+
 
 -- Does a 2D Convolution (updateOutput) on input, weight
 -- output is assumed to be allocated and given.
@@ -55,36 +66,20 @@ cudnn.functional.Convolution2D_updateOutput = function(handle, input, weight, ou
     output = output:dim() == 3 and Batch2D(output) or output
 
     -- create a weight descriptor
-    local weightDesc = ffi.new('struct cudnnFilterStruct*[1]')
-   errcheck('cudnnCreateFilterDescriptor', weightDesc)
    local nOutputPlane, nInputPlane, kH, kW
        = weight:size(1), weight:size(2), weight:size(3), weight:size(4)
-   local desc = torch.IntTensor({nOutputPlane, nInputPlane, kH, kW})
-   errcheck('cudnnSetFilterNdDescriptor', weightDesc[0], 'CUDNN_DATA_FLOAT', 4,
-            desc:data());
-   local function destroyWDesc(d)
-      errcheck('cudnnDestroyFilterDescriptor', d[0]);
-   end
-   ffi.gc(weightDesc, destroyWDesc)
+   local weightDesc = cudnn.setFilterDescriptor(
+      { dataType = cudnn.typemap[torch.type(input)],
+        filterDimA = {nOutputPlane, nInputPlane, kH, kW}})
 
    -- create a convolution descriptor
-   local convDesc = ffi.new('struct cudnnConvolutionStruct*[1]')
-   errcheck('cudnnCreateConvolutionDescriptor', convDesc)
-   local pad = torch.IntTensor({padH, padW})
-   local stride = torch.IntTensor({strideH, strideW})
-   local upscale = torch.IntTensor({1,1})
-   errcheck('cudnnSetConvolutionNdDescriptor_v3', convDesc[0],
-            2, pad:data(),
-            stride:data(), upscale:data(), 'CUDNN_CROSS_CORRELATION',
-            'CUDNN_DATA_FLOAT');
-   local function destroyConvDesc(d)
-       errcheck('cudnnDestroyConvolutionDescriptor', d[0]);
-   end
-   ffi.gc(convDesc, destroyConvDesc)
+   local convDescData = { padA = {padH, padW},
+        filterStrideA = {strideH, strideW},
+        dataType = getMathType(weight) }
+   local convDesc = cudnn.setConvolutionDescriptor(convDescData);
 
     -- create input descriptor
    local iDesc = cudnn.toDescriptor(input)
-
    -- create output descriptor
    local oSize = torch.IntTensor(4)
    errcheck('cudnnGetConvolutionNdForwardOutputDim',
@@ -100,27 +95,32 @@ cudnn.functional.Convolution2D_updateOutput = function(handle, input, weight, ou
    -- create descriptor for output
    local oDesc = cudnn.toDescriptor(output)
 
-   -- create forwardAlgorithm descriptors for
-   local algType = ffi.new("cudnnConvolutionFwdAlgo_t[?]", 1)
-   local algSearchMode = 'CUDNN_CONVOLUTION_FWD_SPECIFY_WORKSPACE_LIMIT'
-   local algWorkspaceLimit = 0
-   if workspace then
-       algWorkspaceLimit = workspace:nElement() * 4 -- 4 = sizeof float
-   end
-   errcheck('cudnnGetConvolutionForwardAlgorithm',
-            handle,
-            iDesc[0], weightDesc[0],
-            convDesc[0], oDesc[0],
-            algSearchMode, algWorkspaceLimit, algType)
+   local layer = {
+      convDescData = convDescData,
+      convDesc = convDesc,
+      weight = weight,
+      nInputPlane = nInputPlane,
+      nOutputPlane = nOutputPlane,
+      kW = kW,
+      kH = kH,
+      pad = {padH, padW},
+      stride = {strideH, strideW},
+   }
+
+   local finder = find.get()
+   find:prepare(layer, input, output)
+   local fwdAlgo = finder:forwardAlgorithm(layer, {iDesc[0], input, weightDesc[0],
+                                                   weight, convDesc[0], oDesc[0], output})
+   local extraBuffer, extraBufferSize = cudnn.getSharedWorkspace()
 
    -- do convolution
    errcheck('cudnnConvolutionForward', handle,
-            one:data(),
+            cudnn.scalar(input, 1),
             iDesc[0], input:data(),
             weightDesc[0], weight:data(),
-            convDesc[0], algType[0],
-            workspace and workspace:data() or nil, algWorkspaceLimit,
-            zero:data(),
+            convDesc[0], fwdAlgo,
+            extraBuffer, extraBufferSize,
+            cudnn.scalar(input, 0),
             oDesc[0], output:data());
 end
 
@@ -134,122 +134,100 @@ cudnn.functional.Convolution2D_updateGradInput = function(handle, input, weight,
     gradInput = gradInput:dim() == 3 and Batch2D(gradInput) or gradInput
 
     -- create a weight descriptor
-    local weightDesc = ffi.new('struct cudnnFilterStruct*[1]')
-   errcheck('cudnnCreateFilterDescriptor', weightDesc)
    local nOutputPlane, nInputPlane, kH, kW
        = weight:size(1), weight:size(2), weight:size(3), weight:size(4)
-   local desc = torch.IntTensor({nOutputPlane, nInputPlane, kH, kW})
-   errcheck('cudnnSetFilterNdDescriptor', weightDesc[0], 'CUDNN_DATA_FLOAT', 4,
-            desc:data());
-   local function destroyWDesc(d)
-      errcheck('cudnnDestroyFilterDescriptor', d[0]);
-   end
-   ffi.gc(weightDesc, destroyWDesc)
+   local weightDesc = cudnn.setFilterDescriptor(
+      { dataType = cudnn.typemap[torch.type(input)],
+        filterDimA = {nOutputPlane, nInputPlane, kH, kW} })
 
    -- create a convolution descriptor
-   local convDesc = ffi.new('struct cudnnConvolutionStruct*[1]')
-   errcheck('cudnnCreateConvolutionDescriptor', convDesc)
-   local pad = torch.IntTensor({padH, padW})
-   local stride = torch.IntTensor({strideH, strideW})
-   local upscale = torch.IntTensor({1,1})
-   errcheck('cudnnSetConvolutionNdDescriptor_v3', convDesc[0],
-            2, pad:data(),
-            stride:data(), upscale:data(), 'CUDNN_CROSS_CORRELATION',
-            'CUDNN_DATA_FLOAT');
-   local function destroyConvDesc(d)
-       errcheck('cudnnDestroyConvolutionDescriptor', d[0]);
-   end
-   ffi.gc(convDesc, destroyConvDesc)
-
+   local convDescData = { padA = {padH, padW},
+                          filterStrideA = {strideH, strideW},
+                          dataType = getMathType(weight)
+                        }
+   local convDesc = cudnn.setConvolutionDescriptor(convDescData);
     -- create input, output descriptor
    local iDesc = cudnn.toDescriptor(input)
    local oDesc = cudnn.toDescriptor(output)
 
-   local algType = ffi.new("cudnnConvolutionBwdDataAlgo_t[?]", 1)
-   local algSearchMode = 'CUDNN_CONVOLUTION_BWD_DATA_NO_WORKSPACE'
+   local layer = {
+      convDescData = convDescData,
+      convDesc = convDesc,
+      weight = weight,
+      nInputPlane = nInputPlane,
+      nOutputPlane = nOutputPlane,
+      kW = kW,
+      kH = kH,
+      pad = {padH, padW},
+      stride = {strideH, strideW},
+   }
 
-   errcheck('cudnnGetConvolutionBackwardDataAlgorithm',
-            cudnn.getHandle(),
-            weightDesc[0], oDesc[0],
-            convDesc[0], iDesc[0],
-            algSearchMode, 0, algType)
+   local finder = find.get()
+   find:prepare(layer, input, output)
+   local bwdDataAlgo = finder:backwardDataAlgorithm(layer, {weightDesc[0], weight, oDesc[0],
+                                                    output, convDesc[0], iDesc[0], input})
+   local extraBuffer, extraBufferSize = cudnn.getSharedWorkspace()
 
    -- do convolution
-   errcheck('cudnnConvolutionBackwardData_v3', handle,
-               one:data(),
+   errcheck('cudnnConvolutionBackwardData', handle,
+               cudnn.scalar(input, 1),
                weightDesc[0], weight:data(),
                oDesc[0], gradOutput:data(),
-               convDesc[0],
-               algType[0],
-               NULL, 0,
-               zero:data(),
+               convDesc[0], bwdDataAlgo,
+               extraBuffer, extraBufferSize,
+               cudnn.scalar(input, 0),
                iDesc[0], gradInput:data());
-
-
 end
 
 -- accumulates the gradients into gradWeight.
 -- gradWeight is assumed to be allocated and given.
-local scaleT = torch.FloatTensor(1):fill(1.0)
 cudnn.functional.Convolution2D_accGradParameters = function(handle, input, gradWeight, gradOutput,
-                                                   strideH, strideW, padH, padW, scale)
+                                                   strideH, strideW, padH, padW, scale, alpha)
     input = input:dim() == 3 and Batch2D(input) or input
     gradOutput = gradOutput:dim() == 3 and Batch2D(gradOutput) or gradOutput
 
-    scale = scale or 1.0
-    scaleT[1] = scale
     -- create a weight descriptor
-    local weightDesc = ffi.new('struct cudnnFilterStruct*[1]')
-    errcheck('cudnnCreateFilterDescriptor', weightDesc)
     local nOutputPlane, nInputPlane, kH, kW
         = gradWeight:size(1), gradWeight:size(2), gradWeight:size(3), gradWeight:size(4)
-    local desc = torch.IntTensor({nOutputPlane, nInputPlane, kH, kW})
-    errcheck('cudnnSetFilterNdDescriptor', weightDesc[0], 'CUDNN_DATA_FLOAT', 4,
-             desc:data());
-    local function destroyWDesc(d)
-        errcheck('cudnnDestroyFilterDescriptor', d[0]);
-    end
-    ffi.gc(weightDesc, destroyWDesc)
 
+    local weightDesc =  cudnn.setFilterDescriptor({ dataType = cudnn.typemap[torch.type(input)],
+                                                    filterDimA = {nOutputPlane, nInputPlane, kH, kW}})
     -- create a convolution descriptor
-    local convDesc = ffi.new('struct cudnnConvolutionStruct*[1]')
-    errcheck('cudnnCreateConvolutionDescriptor', convDesc)
-    local pad = torch.IntTensor({padH, padW})
-    local stride = torch.IntTensor({strideH, strideW})
-    local upscale = torch.IntTensor({1,1})
-    errcheck('cudnnSetConvolutionNdDescriptor_v3', convDesc[0],
-             2, pad:data(),
-             stride:data(), upscale:data(), 'CUDNN_CROSS_CORRELATION',
-             'CUDNN_DATA_FLOAT');
-    local function destroyConvDesc(d)
-        errcheck('cudnnDestroyConvolutionDescriptor', d[0]);
-    end
-    ffi.gc(convDesc, destroyConvDesc)
+    local convDescData = { padA = {padH, padW},
+                           filterStrideA = {strideH, strideW},
+                           dataType = getMathType(gradWeight) }
+    local convDesc = cudnn.setConvolutionDescriptor(convDescData);
 
     -- create input, output descriptor
     local iDesc = cudnn.toDescriptor(input)
     local oDesc = cudnn.toDescriptor(gradOutput)
 
-    local algType = ffi.new("cudnnConvolutionBwdFilterAlgo_t[?]", 1)
-    local algSearchMode = 'CUDNN_CONVOLUTION_BWD_FILTER_NO_WORKSPACE'
-    local algWorkspaceLimit = 0
+   local layer = {
+      convDesc = convDesc,
+      convDescData = convDescData,
+      weight = gradWeight,
+      nInputPlane = nInputPlane,
+      nOutputPlane = nOutputPlane,
+      kW = kW,
+      kH = kH,
+      pad = {padH, padW},
+      stride = {strideH, strideW},
+   }
 
-    errcheck('cudnnGetConvolutionBackwardFilterAlgorithm',
-             cudnn.getHandle(),
-             iDesc[0], oDesc[0],
-             convDesc[0], weightDesc[0],
-             algSearchMode, algWorkspaceLimit, algType)
-
+   local finder = find.get()
+   find:prepare(layer, input, gradOutput)
+   local bwdFilterAlgo = finder:backwardFilterAlgorithm(layer, {iDesc[0], input, oDesc[0],
+                                                                gradOutput, convDesc[0], weightDesc[0], gradWeight})
+   local extraBuffer, extraBufferSize = cudnn.getSharedWorkspace()
 
     -- do convolution
-    errcheck('cudnnConvolutionBackwardFilter_v3', handle,
-             scaleT:data(),
+    errcheck('cudnnConvolutionBackwardFilter', handle,
+             scalar(gradWeight, scale or 1),
              iDesc[0], input:data(),
              oDesc[0], gradOutput:data(),
-             convDesc[0],
-             algType[0],
-             NULL, 0,
-             one:data(),
+             convDesc[0], bwdFilterAlgo,
+             extraBuffer, extraBufferSize,
+             scalar(gradWeight, alpha or 1),
              weightDesc[0], gradWeight:data());
 end
 
@@ -284,7 +262,7 @@ cudnn.functional.Pooling_updateOutput = function(handle, mode, input, output,
     local ker = torch.IntTensor({kH, kW})
     local str = torch.IntTensor({dH, dW})
     local pad = torch.IntTensor({padH, padW})
-    errcheck('cudnnSetPoolingNdDescriptor', poolDesc[0], mode, 2,
+    errcheck('cudnnSetPoolingNdDescriptor', poolDesc[0], mode, 'CUDNN_PROPAGATE_NAN', 2,
              ker:data(), pad:data(), str:data());
     local function destroyPoolDesc(d)
         errcheck('cudnnDestroyPoolingDescriptor', d[0]);
@@ -298,9 +276,9 @@ cudnn.functional.Pooling_updateOutput = function(handle, mode, input, output,
     -- pool
     errcheck('cudnnPoolingForward', handle,
              poolDesc[0],
-             one:data(),
+             cudnn.scalar(input, 1),
              iDesc[0], input:data(),
-             zero:data(),
+             cudnn.scalar(input, 0),
              oDesc[0], output:data());
 end
 
@@ -347,7 +325,7 @@ cudnn.functional.Pooling_updateGradInput = function(handle, mode, input, output,
     local ker = torch.IntTensor({kH, kW})
     local str = torch.IntTensor({dH, dW})
     local pad = torch.IntTensor({padH, padW})
-    errcheck('cudnnSetPoolingNdDescriptor', poolDesc[0], mode, 2,
+    errcheck('cudnnSetPoolingNdDescriptor', poolDesc[0], mode, 'CUDNN_PROPAGATE_NAN', 2,
              ker:data(), pad:data(), str:data());
     local function destroyPoolDesc(d)
         errcheck('cudnnDestroyPoolingDescriptor', d[0]);
@@ -361,11 +339,11 @@ cudnn.functional.Pooling_updateGradInput = function(handle, mode, input, output,
     -- pool
     errcheck('cudnnPoolingBackward',
              handle, poolDesc[0],
-             one:data(),
+             cudnn.scalar(input, 1),
              oDesc[0], output:data(),
              oDesc[0], gradOutput:data(),
              iDesc[0], input:data(),
-             zero:data(),
+             cudnn.scalar(input, 0),
              iDesc[0], gradInput:data());
 end
 
@@ -379,4 +357,129 @@ cudnn.functional.AveragePooling2D_updateGradInput = function(handle, input, outp
                                                kH, kW, dH, dW, padH, padW, ceil_mode)
     cudnn.functional.Pooling_updateGradInput(handle, 'CUDNN_POOLING_AVERAGE', input, output, gradOutput, gradInput,
                                           kH, kW, dH, dW, padH, padW, ceil_mode);
+end
+
+local function createPointwiseDescriptors(mode, input, output)
+   local activDesc = ffi.new('struct cudnnActivationStruct*[1]')
+   errcheck('cudnnCreateActivationDescriptor', activDesc)
+   errcheck('cudnnSetActivationDescriptor', activDesc[0], mode, 'CUDNN_PROPAGATE_NAN', 0.0);
+
+   local function destroyADesc(a)
+      if (a[0]) then
+         errcheck('cudnnDestroyActivationDescriptor', a[0]);
+         a[0] = nil
+      end
+   end
+   ffi.gc(activDesc, destroyADesc)
+
+   local iDesc = cudnn.toDescriptor(input:view(1,1,1,-1))
+   return activDesc, iDesc
+end
+
+local function pointwise_updateOutput(handle, mode, input, output)
+   local activDesc, iDesc = createPointwiseDescriptors(mode, input, output)
+   errcheck('cudnnActivationForward',
+            handle, activDesc[0],
+            cudnn.scalar(input, 1),
+            iDesc[0], input:data(),
+            cudnn.scalar(input, 0),
+            iDesc[0], output:data());
+end
+
+local function pointwise_updateGradInput(handle, mode, input, output, gradOutput, gradInput)
+   local activDesc, iDesc = createPointwiseDescriptors(mode, input, output)
+   errcheck('cudnnActivationBackward',
+            handle, activDesc[0],
+            cudnn.scalar(input, 1),
+            iDesc[0], output:data(),
+            iDesc[0], gradOutput:data(),
+            iDesc[0], input:data(),
+            cudnn.scalar(input, 0),
+            iDesc[0], gradInput:data());
+end
+
+cudnn.functional.ReLU_updateOutput = function(handle, input, output)
+   output:resizeAs(input)
+   pointwise_updateOutput(handle, 'CUDNN_ACTIVATION_RELU', input, output)
+end
+
+cudnn.functional.ReLU_updateGradInput = function(handle, input, output, gradOutput, gradInput)
+   gradInput:resizeAs(input)
+   pointwise_updateGradInput(handle, 'CUDNN_ACTIVATION_RELU', input, output, gradOutput, gradInput)
+end
+
+cudnn.functional.Tanh_updateOutput = function(handle, input, output)
+   output:resizeAs(input)
+   pointwise_updateOutput(handle, 'CUDNN_ACTIVATION_TANH', input, output)
+end
+
+cudnn.functional.Tanh_updateGradInput = function(handle, input, output, gradOutput, gradInput)
+   gradInput:resizeAs(input)
+   pointwise_updateGradInput(handle, 'CUDNN_ACTIVATION_TANH', input, output, gradOutput, gradInput)
+end
+
+cudnn.functional.Sigmoid_updateOutput = function(handle, input, output)
+   output:resizeAs(input)
+   pointwise_updateOutput(handle, 'CUDNN_ACTIVATION_SIGMOID', input, output)
+end
+
+cudnn.functional.Sigmoid_updateGradInput = function(handle, input, output, gradOutput, gradInput)
+   gradInput:resizeAs(input)
+   pointwise_updateGradInput(handle, 'CUDNN_ACTIVATION_SIGMOID', input, output, gradOutput, gradInput)
+end
+
+
+local function softmax_updateOutput(handle, mode, algorithm, input, output)
+   output:resizeAs(input)
+   local iDesc = cudnn.toDescriptor(input)
+   local oDesc = cudnn.toDescriptor(output)
+   errcheck('cudnnSoftmaxForward',
+            handle,
+            mode, algorithm,
+            cudnn.scalar(input, 1),
+            iDesc[0], input:data(),
+            cudnn.scalar(input, 0),
+            oDesc[0], output:data());
+end
+
+local function softmax_updateGradInput(handle, mode, algorithm, input, output, gradOutput, gradInput)
+   gradInput:resizeAs(input)
+   local iDesc = cudnn.toDescriptor(input)
+   local oDesc = cudnn.toDescriptor(output)
+   errcheck('cudnnSoftmaxBackward',
+            handle,
+            mode, algorithm,
+            cudnn.scalar(input, 1),
+            oDesc[0], output:data(),
+            oDesc[0], gradOutput:data(),
+            cudnn.scalar(input, 0),
+            iDesc[0], gradInput:data());
+end
+
+cudnn.functional.LogSoftMax_updateOutput = function(handle, input, output)
+   softmax_updateOutput(handle,
+                        'CUDNN_SOFTMAX_LOG',
+                        'CUDNN_SOFTMAX_MODE_INSTANCE',
+                        input, output)
+end
+
+cudnn.functional.LogSoftMax_updateGradInput = function(handle, input, output, gradOutput, gradInput)
+   softmax_updateGradInput(handle,
+                           'CUDNN_SOFTMAX_LOG',
+                           'CUDNN_SOFTMAX_MODE_INSTANCE',
+                           input, output, gradOutput, gradInput)
+end
+
+cudnn.functional.SoftMax_updateOutput = function(handle, input, output)
+   softmax_updateOutput(handle,
+                        'CUDNN_SOFTMAX_ACCURATE',
+                        'CUDNN_SOFTMAX_MODE_INSTANCE',
+                        input, output)
+end
+
+cudnn.functional.SoftMax_updateGradInput = function(handle, input, output, gradOutput, gradInput)
+   softmax_updateGradInput(handle,
+                           'CUDNN_SOFTMAX_ACCURATE',
+                           'CUDNN_SOFTMAX_MODE_INSTANCE',
+                           input, output, gradOutput, gradInput)
 end
